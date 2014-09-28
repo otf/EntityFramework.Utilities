@@ -25,50 +25,54 @@ namespace EntityFramework.Utilities
             where T : class
             where TChild : class
         {
-            MemberExpression collectionSelector2 = null;
-            LambdaExpression collectionSelector3 = null;
-            var mce = collectionSelector.Body as MethodCallExpression;
+            Expression<Func<T, IEnumerable<TChild>>> collectionSelector1 = collectionSelector;
+            LambdaExpression collectionSelector2 = null;
+            Type firstType = typeof(T);
+            Type intermidiateType;
+            bool existIntermediate = false;
+            Type terminalType = null;
+            var mce = collectionSelector1.Body as MethodCallExpression;
             if (mce != null && mce.Method.Name == "SelectMany")
             {
-                collectionSelector2 = (MemberExpression)mce.Arguments[0];
-                collectionSelector3 = (LambdaExpression)mce.Arguments[1];
+                var intermediateAccess = (MemberExpression)mce.Arguments[0];
+                collectionSelector2 = (LambdaExpression)mce.Arguments[1];
+                intermidiateType = intermediateAccess.Type.GetGenericArguments().First();
+                terminalType = typeof(TChild);
+                existIntermediate = true;
+            }
+            else
+            {
+                intermidiateType = typeof(TChild);
+                terminalType = intermidiateType;
             }
 
             var octx = (context as IObjectContextAdapter).ObjectContext;
             var cSpaceTables = octx.MetadataWorkspace.GetItems<EntityType>(DataSpace.CSpace);
 
-            Type intermidiateType = collectionSelector2 != null ? collectionSelector2.Type.GetGenericArguments().First() : typeof(TChild);
-
-            Delegate fkGetter =  GetForeignKeyGetter(typeof(T), intermidiateType, cSpaceTables);
-            Delegate fkGetter2 = collectionSelector2 != null ? GetForeignKeyGetter(intermidiateType, typeof(TChild), cSpaceTables) : null;
-
-            var cSpaceType = cSpaceTables.Single(t => t.Name == typeof(T).Name); //Use single to avoid any problems with multiple tables using the same type
-            var cSpaceType2 = cSpaceTables.Single(t => t.Name == intermidiateType.Name); //Use single to avoid any problems with multiple tables using the same type
-            var keys = cSpaceType.KeyProperties;
-            if (keys.Count > 1)
-            {
-                throw new InvalidOperationException("The include method only works on single key entities");
-            }
-            var keys2 = cSpaceType2.KeyProperties;
-            if (keys2.Count > 1)
-            {
-                throw new InvalidOperationException("The include method only works on single key entities");
-            }
-            var pkInfo = typeof(T).GetProperty(keys.First().Name);
-            var pkInfo2 = intermidiateType.GetProperty(keys2.First().Name);
-            var pkGetter = MakeGetterDelegate(typeof(T), pkInfo);
-            var pkGetter2 = MakeGetterDelegate(intermidiateType, pkInfo2);
-
+            // for first table
+            Delegate fkGetter = null;
+            EntityType cSpaceType = null;
+            Delegate pkGetter = null;
+            Delegate setter = null;
             var childCollectionModifiers = new List<MethodCallExpression>();
-            var childProp = SetCollectionModifiersAndGetChildProperty(typeof(T), typeof(TChild), collectionSelector, childCollectionModifiers);
-            var setter = MakeSetterDelegate(typeof(T), childProp);
-            Delegate setter2 = null;
-            PropertyInfo childProp2 = null;
-            if (collectionSelector2 != null)
+            if(true)
             {
-                childProp2 = SetCollectionModifiersAndGetChildProperty(intermidiateType, typeof(TChild), collectionSelector3, childCollectionModifiers);
-                setter2 = MakeSetterDelegate(intermidiateType, childProp2);
+                Hoge(collectionSelector, cSpaceTables, ref fkGetter, ref cSpaceType, ref pkGetter, ref setter, childCollectionModifiers, firstType, intermidiateType);
             }
+            // end
+
+            // for second table
+            Delegate fkGetter2 = null;
+            EntityType cSpaceType2 = null;
+            Delegate pkGetter2 = null;
+            Delegate setter2 = null;
+            var childCollectionModifiers2 = new List<MethodCallExpression>();
+            if (existIntermediate)
+            {
+                Hoge(collectionSelector2, cSpaceTables, ref fkGetter2, ref cSpaceType2, ref pkGetter2, ref setter2, childCollectionModifiers2, intermidiateType, terminalType);
+            }
+            // end
+
 
             var e = new IncludeExecuter<T>
             {
@@ -80,13 +84,13 @@ namespace EntityFramework.Utilities
                         return;
                     }
                     var children = octx.CreateObjectSet<TChild>();
-                    var lambdaExpression = GetRootEntityToChildCollectionSelector(typeof(T), typeof(TChild), cSpaceType);
+                    var lambdaExpression = GetRootEntityToChildCollectionSelector(firstType, typeof(TChild), cSpaceType);
 
                     var q = ApplyChildCollectionModifiers<TChild>(children, childCollectionModifiers);
 
                     var rootPK = pkGetter.DynamicInvoke(parent);
                     var param = Expression.Parameter(typeof(TChild), "x");
-                    var fk = GetFKProperty(typeof(T), typeof(TChild), cSpaceTables);
+                    var fk = GetFKProperty(firstType, typeof(TChild), cSpaceTables);
                     var body = Expression.Equal(Expression.Property(param, fk), Expression.Constant(rootPK));
                     var where = Expression.Lambda<Func<TChild, bool>>(body, param);
 
@@ -96,7 +100,7 @@ namespace EntityFramework.Utilities
                 },
                 Loader = (rootFilters, parents) =>
                 {
-                    var baseType = typeof(T).BaseType != typeof(object) ? typeof(T).BaseType : typeof(T);
+                    var baseType = firstType.BaseType != typeof(object) ? firstType.BaseType : firstType;
 
                     dynamic dynamicSet = octx.GetType()
                                     .GetMethod("CreateObjectSet", new Type[] { })
@@ -114,7 +118,7 @@ namespace EntityFramework.Utilities
                         q = q.Provider.CreateQuery<T>(newMethods);
                     }
                     var lambdaExpression = GetRootEntityToChildCollectionSelector(typeof(T), intermidiateType, cSpaceType);
-                    var selectMany = typeof(Queryable).GetMethods().First(m => m.Name == "SelectMany").MakeGenericMethod(new[] { typeof(T), intermidiateType });
+                    var selectMany = typeof(Queryable).GetMethods().First(m => m.Name == "SelectMany").MakeGenericMethod(new[] { firstType, intermidiateType });
                     var childQ = (IEnumerable<object>)selectMany.Invoke(null, new object[] { q, lambdaExpression });
                     {
                         //childQ = ApplyChildCollectionModifiers<TChild>(childQ, childCollectionModifiers);
@@ -133,13 +137,13 @@ namespace EntityFramework.Utilities
                             setter.DynamicInvoke(parent, childs);
                         }
                     }
-                    if (collectionSelector2 != null)
+                    if (existIntermediate)
                     {
                         var lambdaExpression2 = GetRootEntityToChildCollectionSelector(intermidiateType, typeof(TChild), cSpaceType2);
 
-                        var selectMany2 = typeof(Queryable).GetMethods().First(m => m.Name == "SelectMany").MakeGenericMethod(new[] { intermidiateType, typeof(TChild) });
+                        var selectMany2 = typeof(Queryable).GetMethods().First(m => m.Name == "SelectMany").MakeGenericMethod(new[] { intermidiateType, terminalType });
                         var childQ2 = (IEnumerable<object>)selectMany2.Invoke(null, new object[] { childQ, lambdaExpression2 });
-                        var toLookup = typeof(Enumerable).GetMethods().First(m => m.Name == "ToLookup").MakeGenericMethod(new[] { typeof(TChild), typeof(object) });
+                        var toLookup = typeof(Enumerable).GetMethods().First(m => m.Name == "ToLookup").MakeGenericMethod(new[] { terminalType, typeof(object) });
                         var dict = (ILookup<object, TChild>)toLookup.Invoke(null, new object[] { childQ2, fkGetter2 });
                         //childQ = ApplyChildCollectionModifiers<TChild>(childQ, childCollectionModifiers);
                         foreach (var parent in childQ)
@@ -154,6 +158,21 @@ namespace EntityFramework.Utilities
             };
 
             return new EFUQueryable<T>(query.AsNoTracking()).Include(e);
+        }
+
+        private static void Hoge(LambdaExpression collectionSelector, System.Collections.ObjectModel.ReadOnlyCollection<EntityType> cSpaceTables, ref Delegate fkGetter, ref EntityType cSpaceType, ref Delegate pkGetter, ref Delegate setter, List<MethodCallExpression> childCollectionModifiers, Type fromType, Type toType)
+        {
+            fkGetter = GetForeignKeyGetter(fromType, toType, cSpaceTables);
+            cSpaceType = cSpaceTables.Single(t => t.Name == fromType.Name); //Use single to avoid any problems with multiple tables using the same type
+            var keys2 = cSpaceType.KeyProperties;
+            if (keys2.Count > 1)
+            {
+                throw new InvalidOperationException("The include method only works on single key entities");
+            }
+            var pkInfo = fromType.GetProperty(keys2.First().Name);
+            pkGetter = MakeGetterDelegate(fromType, pkInfo);
+            var childProp = SetCollectionModifiersAndGetChildProperty(fromType, toType, collectionSelector, childCollectionModifiers);
+            setter = MakeSetterDelegate(fromType, childProp);
         }
 
         private static IQueryable<TChild> ApplyChildCollectionModifiers<TChild>(IQueryable<TChild> childQ, List<MethodCallExpression> childCollectionModifiers) where TChild : class
