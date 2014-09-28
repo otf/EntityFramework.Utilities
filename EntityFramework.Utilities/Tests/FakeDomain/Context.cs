@@ -22,6 +22,7 @@ namespace Tests.FakeDomain
         public DbSet<PhoneNumber> PhoneNumbers { get; set; }
         public DbSet<Email> Emails { get; set; }
         public DbSet<Comment> Comments { get; set; }
+        public DbSet<SubComment> SubComments { get; set; }
 
         protected override void OnModelCreating(DbModelBuilder modelBuilder)
         {

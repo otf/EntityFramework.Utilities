@@ -25,23 +25,50 @@ namespace EntityFramework.Utilities
             where T : class
             where TChild : class
         {
+            MemberExpression collectionSelector2 = null;
+            LambdaExpression collectionSelector3 = null;
+            var mce = collectionSelector.Body as MethodCallExpression;
+            if (mce != null && mce.Method.Name == "SelectMany")
+            {
+                collectionSelector2 = (MemberExpression)mce.Arguments[0];
+                collectionSelector3 = (LambdaExpression)mce.Arguments[1];
+            }
+
             var octx = (context as IObjectContextAdapter).ObjectContext;
             var cSpaceTables = octx.MetadataWorkspace.GetItems<EntityType>(DataSpace.CSpace);
+
+            Type intermidiateType = collectionSelector2 != null ? collectionSelector2.Type.GetGenericArguments().First() : typeof(TChild);
+
+            Delegate fkGetter =  GetForeignKeyGetter(typeof(T), intermidiateType, cSpaceTables);
+            Delegate fkGetter2 = collectionSelector2 != null ? GetForeignKeyGetter(intermidiateType, typeof(TChild), cSpaceTables) : null;
+
             var cSpaceType = cSpaceTables.Single(t => t.Name == typeof(T).Name); //Use single to avoid any problems with multiple tables using the same type
+            var cSpaceType2 = cSpaceTables.Single(t => t.Name == intermidiateType.Name); //Use single to avoid any problems with multiple tables using the same type
             var keys = cSpaceType.KeyProperties;
             if (keys.Count > 1)
             {
                 throw new InvalidOperationException("The include method only works on single key entities");
             }
-
-            var fkGetter = GetForeignKeyGetter<T, TChild>(cSpaceTables);
-
-            PropertyInfo pkInfo = typeof(T).GetProperty(keys.First().Name);
-            var pkGetter = MakeGetterDelegate<T>(pkInfo);
+            var keys2 = cSpaceType2.KeyProperties;
+            if (keys2.Count > 1)
+            {
+                throw new InvalidOperationException("The include method only works on single key entities");
+            }
+            var pkInfo = typeof(T).GetProperty(keys.First().Name);
+            var pkInfo2 = intermidiateType.GetProperty(keys2.First().Name);
+            var pkGetter = MakeGetterDelegate(typeof(T), pkInfo);
+            var pkGetter2 = MakeGetterDelegate(intermidiateType, pkInfo2);
 
             var childCollectionModifiers = new List<MethodCallExpression>();
-            var childProp = SetCollectionModifiersAndGetChildProperty<T, TChild>(collectionSelector, childCollectionModifiers);
-            var setter = MakeSetterDelegate<T>(childProp);
+            var childProp = SetCollectionModifiersAndGetChildProperty(typeof(T), typeof(TChild), collectionSelector, childCollectionModifiers);
+            var setter = MakeSetterDelegate(typeof(T), childProp);
+            Delegate setter2 = null;
+            PropertyInfo childProp2 = null;
+            if (collectionSelector2 != null)
+            {
+                childProp2 = SetCollectionModifiersAndGetChildProperty(intermidiateType, typeof(TChild), collectionSelector3, childCollectionModifiers);
+                setter2 = MakeSetterDelegate(intermidiateType, childProp2);
+            }
 
             var e = new IncludeExecuter<T>
             {
@@ -53,32 +80,32 @@ namespace EntityFramework.Utilities
                         return;
                     }
                     var children = octx.CreateObjectSet<TChild>();
-                    var lambdaExpression = GetRootEntityToChildCollectionSelector<T, TChild>(cSpaceType);
+                    var lambdaExpression = GetRootEntityToChildCollectionSelector(typeof(T), typeof(TChild), cSpaceType);
 
                     var q = ApplyChildCollectionModifiers<TChild>(children, childCollectionModifiers);
 
-                    var rootPK = pkGetter((T)parent);
+                    var rootPK = pkGetter.DynamicInvoke(parent);
                     var param = Expression.Parameter(typeof(TChild), "x");
-                    var fk = GetFKProperty<T, TChild>(cSpaceTables);
+                    var fk = GetFKProperty(typeof(T), typeof(TChild), cSpaceTables);
                     var body = Expression.Equal(Expression.Property(param, fk), Expression.Constant(rootPK));
                     var where = Expression.Lambda<Func<TChild, bool>>(body, param);
 
                     q = q.AsNoTracking().Where(where);
 
-                    setter((T)parent, q.ToList());
+                    setter.DynamicInvoke(parent, q.ToList());
                 },
                 Loader = (rootFilters, parents) =>
                 {
                     var baseType = typeof(T).BaseType != typeof(object) ? typeof(T).BaseType : typeof(T);
-                    
+
                     dynamic dynamicSet = octx.GetType()
                                     .GetMethod("CreateObjectSet", new Type[] { })
                                     .MakeGenericMethod(baseType)
                                     .Invoke(octx, new Object[] { });
 
                     var set = dynamicSet.OfType<T>() as ObjectQuery<T>;
-
                     IQueryable<T> q = set;
+
                     foreach (var item in rootFilters)
                     {
                         var newSource = Expression.Constant(q);
@@ -86,21 +113,43 @@ namespace EntityFramework.Utilities
                         var newMethods = Expression.Call(item.Method, arguments);
                         q = q.Provider.CreateQuery<T>(newMethods);
                     }
-
-                    var lambdaExpression = GetRootEntityToChildCollectionSelector<T, TChild>(cSpaceType);
-
-                    var childQ = q.SelectMany(lambdaExpression);
-                    childQ = ApplyChildCollectionModifiers<TChild>(childQ, childCollectionModifiers);
-
-                    var dict = childQ.AsNoTracking().ToLookup(fkGetter);
-                    var list = parents.Cast<T>().ToList();
-
-                    foreach (var parent in list)
+                    var lambdaExpression = GetRootEntityToChildCollectionSelector(typeof(T), intermidiateType, cSpaceType);
+                    var selectMany = typeof(Queryable).GetMethods().First(m => m.Name == "SelectMany").MakeGenericMethod(new[] { typeof(T), intermidiateType });
+                    var childQ = (IEnumerable<object>)selectMany.Invoke(null, new object[] { q, lambdaExpression });
                     {
-                        var prop = pkGetter(parent);
-                        var childs = dict.Contains(prop) ? dict[prop].ToList() : new List<TChild>();
-                        setter(parent, childs);
+                        //childQ = ApplyChildCollectionModifiers<TChild>(childQ, childCollectionModifiers);
+
+                        var toLookup = typeof(Enumerable).GetMethods().First(m => m.Name == "ToLookup").MakeGenericMethod(new[] { intermidiateType, typeof(object) });
+                        var dict = toLookup.Invoke(null, new object[] { childQ, fkGetter });
+                        var list = parents.Cast<T>().ToList();
+
+                        foreach (var parent in list)
+                        {
+                            var prop = pkGetter.DynamicInvoke(parent);
+                            var contains = typeof(ILookup<,>).MakeGenericType(typeof(object), intermidiateType).GetMethod("Contains");
+                            var at = typeof(ILookup<,>).MakeGenericType(typeof(object), intermidiateType).GetProperty("Item").GetGetMethod();
+                            var toList = typeof(Enumerable).GetMethod("ToList").MakeGenericMethod(intermidiateType);
+                            var childs = ((bool)contains.Invoke(dict, new []{ prop})) ? toList.Invoke(null, new []{ (object) (at.Invoke(dict, new [] { prop }))}) : (object)new List<object>();
+                            setter.DynamicInvoke(parent, childs);
+                        }
                     }
+                    if (collectionSelector2 != null)
+                    {
+                        var lambdaExpression2 = GetRootEntityToChildCollectionSelector(intermidiateType, typeof(TChild), cSpaceType2);
+
+                        var selectMany2 = typeof(Queryable).GetMethods().First(m => m.Name == "SelectMany").MakeGenericMethod(new[] { intermidiateType, typeof(TChild) });
+                        var childQ2 = (IEnumerable<object>)selectMany2.Invoke(null, new object[] { childQ, lambdaExpression2 });
+                        var toLookup = typeof(Enumerable).GetMethods().First(m => m.Name == "ToLookup").MakeGenericMethod(new[] { typeof(TChild), typeof(object) });
+                        var dict = (ILookup<object, TChild>)toLookup.Invoke(null, new object[] { childQ2, fkGetter2 });
+                        //childQ = ApplyChildCollectionModifiers<TChild>(childQ, childCollectionModifiers);
+                        foreach (var parent in childQ)
+                        {
+                            var prop = (object)pkGetter2.DynamicInvoke(parent);
+                            var childs = dict.Contains(prop) ? dict[prop].ToList() : new List<TChild>();
+                            setter2.DynamicInvoke(parent, childs);
+                        }
+                    }
+
                 }
             };
 
@@ -129,9 +178,7 @@ namespace EntityFramework.Utilities
             return childQ;
         }
 
-        private static PropertyInfo SetCollectionModifiersAndGetChildProperty<T, TChild>(Expression<Func<T, IEnumerable<TChild>>> collectionSelector, List<MethodCallExpression> childCollectionModifiers)
-            where T : class
-            where TChild : class
+        private static PropertyInfo SetCollectionModifiersAndGetChildProperty(Type parentType, Type childType, LambdaExpression collectionSelector, List<MethodCallExpression> childCollectionModifiers)
         {
             var temp = collectionSelector.Body;
             while (temp is MethodCallExpression)
@@ -150,22 +197,18 @@ namespace EntityFramework.Utilities
             return childProp;
         }
 
-        private static Func<TChild, object> GetForeignKeyGetter<T, TChild>(System.Collections.ObjectModel.ReadOnlyCollection<EntityType> cSpaceTables)
-            where T : class
-            where TChild : class
+        private static Delegate GetForeignKeyGetter(Type parentType, Type childType , System.Collections.ObjectModel.ReadOnlyCollection<EntityType> cSpaceTables)
         {
-            var fkInfo = GetFKProperty<T, TChild>(cSpaceTables);
-            var fkGetter = MakeGetterDelegate<TChild>(fkInfo);
+            var fkInfo = GetFKProperty(parentType, childType, cSpaceTables);
+            var fkGetter = MakeGetterDelegate(childType, fkInfo);
             return fkGetter;
         }
 
-        private static PropertyInfo GetFKProperty<T, TChild>(System.Collections.ObjectModel.ReadOnlyCollection<EntityType> cSpaceTables)
-            where T : class
-            where TChild : class
+        private static PropertyInfo GetFKProperty(Type parentType, Type childType, System.Collections.ObjectModel.ReadOnlyCollection<EntityType> cSpaceTables)
         {
-            var cSpaceChildType = cSpaceTables.Single(t => t.Name == typeof(TChild).Name); //Use single to avoid any problems with multiple tables using the same type
-            var fk = cSpaceChildType.NavigationProperties.First(n => n.ToEndMember.GetEntityType().Name == typeof(T).Name).GetDependentProperties().First();
-            var fkInfo = typeof(TChild).GetProperty(fk.Name);
+            var cSpaceChildType = cSpaceTables.Single(t => t.Name == childType.Name); //Use single to avoid any problems with multiple tables using the same type
+            var fk = cSpaceChildType.NavigationProperties.First(n => n.ToEndMember.GetEntityType().Name == parentType.Name).GetDependentProperties().First();
+            var fkInfo = childType.GetProperty(fk.Name);
             return fkInfo;
         }
 
@@ -183,26 +226,27 @@ namespace EntityFramework.Utilities
             return (IOrderedQueryable<TChild>)query.Provider.CreateQuery<TChild>(call);
         }
 
-        private static Expression<Func<T, IEnumerable<TChild>>> GetRootEntityToChildCollectionSelector<T, TChild>(EntityType cSpaceType)
-            where T : class
-            where TChild : class
+        private static Expression GetRootEntityToChildCollectionSelector(Type parentType, Type childType, EntityType cSpaceType)
         {
-            var parameter = Expression.Parameter(typeof(T), "t");
-            var memberExpression = Expression.Property(parameter, cSpaceType.NavigationProperties.First(p => p.ToEndMember.GetEntityType().Name == typeof(TChild).Name).Name);
-            var lambdaExpression = Expression.Lambda<Func<T, IEnumerable<TChild>>>(memberExpression, parameter);
+            var parameter = Expression.Parameter(parentType, "t");
+            var memberExpression = Expression.Property(parameter, cSpaceType.NavigationProperties.First(p => p.ToEndMember.GetEntityType().Name == childType.Name).Name);
+            var fType = typeof(Func<,>);
+            var fTypeInstance = fType.MakeGenericType(parentType, typeof(IEnumerable<>).MakeGenericType(childType));
+
+            var lambdaExpression = Expression.Lambda(fTypeInstance, memberExpression, parameter);
             return lambdaExpression;
         }
 
-        static Action<T, object> MakeSetterDelegate<T>(PropertyInfo property)
+        static Delegate MakeSetterDelegate(Type parentType, PropertyInfo property)
         {
             MethodInfo setMethod = property.GetSetMethod();
             if (setMethod != null && setMethod.GetParameters().Length == 1)
             {
-                var target = Expression.Parameter(typeof(T));
+                var target = Expression.Parameter(parentType);
                 var value = Expression.Parameter(typeof(object));
                 var body = Expression.Call(target, setMethod,
                     Expression.Convert(value, property.PropertyType));
-                return Expression.Lambda<Action<T, object>>(body, target, value)
+                return Expression.Lambda(body, target, value)
                     .Compile();
             }
             else
@@ -211,16 +255,15 @@ namespace EntityFramework.Utilities
             }
         }
 
-        static Func<X, object> MakeGetterDelegate<X>(PropertyInfo property)
+        static Delegate MakeGetterDelegate(Type childType, PropertyInfo property)
         {
             MethodInfo getMethod = property.GetGetMethod();
             if (getMethod != null)
             {
-                var target = Expression.Parameter(typeof(X));
+                var target = Expression.Parameter(childType);
                 var body = Expression.Call(target, getMethod);
                 Expression conversion = Expression.Convert(body, typeof(object));
-                return Expression.Lambda<Func<X, object>>(conversion, target)
-                    .Compile();
+                return Expression.Lambda(conversion, target).Compile();
             }
             else
             {
