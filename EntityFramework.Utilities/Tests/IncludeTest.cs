@@ -76,6 +76,28 @@ namespace Tests
         }
 
         [TestMethod]
+        public void SingleInclude_LoadsChildren_BlogPost_SubComments_WithFilter()
+        {
+            SetupSmallTestSet();
+            using (var db = Context.Sql())
+            {
+                var result = db.BlogPosts.IncludeEFU(db, x => x.Comments.SelectMany(c => c.SubComments.Where(sc => sc.Text != "SC1"))).ToList();
+                var bp1 = result.First(x => x.Title == "BP1");
+                var bp2 = result.First(x => x.Title == "BP2");
+                var bp3 = result.First(x => x.Title == "BP3");
+                var bbb = bp3.Comments.ToList();
+
+                Assert.AreEqual(1, bp1.Comments.Count);
+                Assert.AreEqual("C1", bp1.Comments.First().Text);
+                Assert.AreEqual(0, bp1.Comments.First().SubComments.Count);
+                Assert.AreEqual("C1", bp1.Comments.First().Text);
+                Assert.AreEqual(2, bp2.Comments.Count);
+                Assert.AreEqual("C2", bp2.Comments.First().Text);
+                Assert.AreEqual(3, bp3.Comments.Count);
+            }
+        }
+
+        [TestMethod]
         public void SingleInclude_SortedParent_LoadsChildren()
         {
             SetupSmallTestSet();
